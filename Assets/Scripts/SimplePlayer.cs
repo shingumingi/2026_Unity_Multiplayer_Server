@@ -1,5 +1,4 @@
 using Fusion;
-using Unity.VisualScripting;
 using UnityEngine;
 
 public class SimplePlayer : NetworkBehaviour
@@ -10,6 +9,9 @@ public class SimplePlayer : NetworkBehaviour
     [Header("Bullet")]
     [SerializeField] private NetworkPrefabRef bulletPrefab;
     [SerializeField] private Transform firePoint;
+
+    [SerializeField] private float fireDistance = 20f;
+    [SerializeField] private LayerMask hitMask;
 
     [Networked] private TickTimer FireCooldown { get; set; }
     [SerializeField] private float fireInterval = 0.2f;
@@ -42,7 +44,7 @@ public class SimplePlayer : NetworkBehaviour
         {
             if (FireCooldown.ExpiredOrNotRunning(Runner))
             {
-                Fire();
+                FireLagCompensated();
                 FireCooldown = TickTimer.CreateFromSeconds(Runner, fireInterval);
             }
         }
@@ -71,5 +73,44 @@ public class SimplePlayer : NetworkBehaviour
         {
             bullet.Init(Object.InputAuthority);
         }
+    }
+
+    private void FireLagCompensated()
+    {
+        if (!Object.HasStateAuthority)
+            return;
+
+        Vector3 origin = firePoint != null ? firePoint.position : transform.position + Vector3.up * 0.5f;
+        Vector3 direction = transform.forward;
+
+        // Runner -> NetworkRunner => 게임의 네트워크 전체를 관리하는 관리자
+        if (Runner.LagCompensation.Raycast(
+            origin,
+            direction,
+            fireDistance,
+            Object.InputAuthority,
+            out LagCompensatedHit hit,
+            hitMask
+        ))
+        {
+            Debug.Log($"LagComp Hit : {hit.Hitbox.name}");
+            RPC_PlayHitEffect(hit.Point, hit.Normal);
+            Hitbox hitbox = hit.Hitbox;
+            if(hitbox != null)
+            {
+                HealthTarget target = hitbox.GetComponentInParent<HealthTarget>();
+                if (target != null)
+                {
+                    target.TakeDamage(1);
+                }
+            }
+        }
+    }
+
+    [Rpc(RpcSources.StateAuthority, RpcTargets.All)]
+    private void RPC_PlayHitEffect(Vector3 pos, Vector3 normal)
+    {
+        if (EffectManager.instance == null) return;
+        EffectManager.instance.PlayerWorldEffect(EffectManager.instance.HitEffect, pos, normal);
     }
 }
