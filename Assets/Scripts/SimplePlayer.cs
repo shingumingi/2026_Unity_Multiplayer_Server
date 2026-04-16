@@ -1,6 +1,9 @@
 using Fusion;
 using Newtonsoft.Json.Bson;
+using System.Security.Cryptography;
+using Unity.VisualScripting;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 public class SimplePlayer : NetworkBehaviour
 {
@@ -38,7 +41,33 @@ public class SimplePlayer : NetworkBehaviour
     private int _lastJumpVisualTick = -1;
 
     [SerializeField] private GameObject cameraRoot;
+
+    private Transform cameraRootTransform;
+
+    private Camera localCamera;
     private Transform cameraTransform;
+
+    public static float LocalCameraYaw { get; private set; }
+
+    [Header("Camera")]
+    [SerializeField] private Vector3 cameraFollowOffset = new Vector3(0, 1.5f, 0f);
+    [SerializeField] private float cameraSenesitivity = 3.0f;
+    [SerializeField] private float minPitch = -30f;
+    [SerializeField] private float maxPitch = 60f;
+
+    private float cameraYaw;
+    private float cameraPitch = 15f;
+
+    [Header("Pickup")]
+    [SerializeField] private Transform holdPoint;
+    [SerializeField] private float pickupDistance = 3.0f;
+    [SerializeField] private float dropForce = 2.0f;
+    [SerializeField] private LayerMask pickupMask;
+
+    [Networked] private NetworkObject HeldBox { get; set; }
+
+    public Vector3 HoldPointPosition =>
+        holdPoint != null ? holdPoint.position : transform.position + transform.forward * 1.2f + Vector3.up * 1.2f;
 
     public override void Spawned()
     {
@@ -49,11 +78,20 @@ public class SimplePlayer : NetworkBehaviour
 
         if (isMine)
         {
-            Camera cam = cameraRoot.GetComponentInChildren<Camera>(true);
-            if(cam != null)
+            cameraRootTransform = cameraRoot.transform;
+
+            localCamera = cameraRoot.GetComponentInChildren<Camera>(true);
+            if(localCamera != null)
             {
-                cameraTransform = cam.transform;
+                cameraTransform = localCamera.transform;
             }
+
+            cameraYaw = transform.eulerAngles.y;
+            cameraPitch = 15;
+            LocalCameraYaw = cameraYaw;
+
+            Cursor.lockState = CursorLockMode.Locked;
+            Cursor.visible = false;
         }
     }
 
@@ -62,22 +100,12 @@ public class SimplePlayer : NetworkBehaviour
     {
         if (GetInput<FusionBootstrap.NetworkInputData>(out var inputData))
         {
-            Vector3 move;
+            Quaternion camTawRotation = Quaternion.Euler(0.0f, inputData.cameraYaw, 0.0f);
 
-            if(Object.HasInputAuthority && cameraTransform != null)
-            {
-                Vector3 forward = cameraTransform.forward;
-                forward.y = 0;
-                forward.Normalize();
+            Vector3 forward = camTawRotation * Vector3.forward;
+            Vector3 right = camTawRotation * Vector3.right;
 
-                Vector3 right = Vector3.Cross(forward, Vector3.up).normalized;
-
-                move = forward * inputData.move.y - right * inputData.move.x;
-            }
-            else
-            {
-                move = new Vector3(inputData.move.x, 0.0f, inputData.move.y);
-            }
+            Vector3 move = forward * inputData.move.y + right * inputData.move.x;
 
             if (move.sqrMagnitude > 1f)
                 move.Normalize();
@@ -121,10 +149,6 @@ public class SimplePlayer : NetworkBehaviour
                 transform.position += verticalMove * Runner.DeltaTime;
             }
 
-            PreviousButons = inputData.buttons;
-
-
-
             if (move.sqrMagnitude > 0.001f)
             {
                 Quaternion targetRotation = Quaternion.LookRotation(move, Vector3.up);
@@ -137,6 +161,12 @@ public class SimplePlayer : NetworkBehaviour
             }
         }
 
+        if(inputData.buttons.WasPressed(PreviousButons, (int)FusionBootstrap.InputButton.Pickup))
+        {
+            if(!TryDropHeldBox())
+                TryPickupBox();
+        }
+
         // 발사
         if (inputData.buttons.IsSet((int)FusionBootstrap.InputButton.Fire))
         {
@@ -146,6 +176,8 @@ public class SimplePlayer : NetworkBehaviour
                 FireCooldown = TickTimer.CreateFromSeconds(Runner, fireInterval);
             }
         }
+
+        PreviousButons = inputData.buttons;
     }
 
     private void Fire()
@@ -221,5 +253,62 @@ public class SimplePlayer : NetworkBehaviour
         animator.SetBool("Jump", !IsGroundedNet && VerticalVelocity > 0.1f);
         animator.SetBool("FreeFall", !IsGroundedNet && VerticalVelocity <= 0.1f);
         animator.SetFloat("MotionSpeed", 5f);
+    }
+
+    private void LateUpdate()
+    {
+        if (!Object || !Object.HasInputAuthority || cameraRoot == null || cameraTransform == null) return;
+
+        float mouseX = Input.GetAxis("Mouse X");
+        float mouseY = Input.GetAxis("Mouse Y");
+
+        cameraYaw += mouseX * cameraSenesitivity;
+        cameraPitch -= mouseY * cameraSenesitivity;
+        cameraPitch = Mathf.Clamp(cameraPitch, minPitch, maxPitch);
+
+        // yaw는 루트가 담당
+        cameraRoot.transform.localRotation = Quaternion.Euler(0.0f, cameraYaw - transform.eulerAngles.y, 0f);
+
+        // pitch는 실제 카메라가 담당
+        cameraTransform.localRotation = Quaternion.Euler(cameraPitch, 0.0f, 0.0f);
+
+        LocalCameraYaw = cameraTransform.eulerAngles.y;
+    }
+
+    void TryPickupBox()
+    {
+        if(!Object.HasStateAuthority) return;
+
+        if (HeldBox != null) return;
+
+        Vector3 origin = transform.position;
+        Vector3 direction = transform.forward;
+
+        Debug.DrawRay(origin, direction * pickupDistance, Color.red, 3f);
+
+        if (Physics.Raycast(origin, direction, out RaycastHit hit, pickupDistance, pickupMask))
+        {
+            PickableBox box = hit.collider.GetComponentInChildren<PickableBox>();
+            if (box == null) return;
+
+            box.PickUp(Object.InputAuthority);
+            HeldBox = box.Object;
+        }
+    }
+
+    private bool TryDropHeldBox()
+    {
+        if (!Object.HasStateAuthority)
+            return false;
+
+        if (HeldBox == null)
+            return false;
+
+        PickableBox box = HeldBox.GetComponent<PickableBox>();
+        if (box == null) return false;
+
+        box.Drop(transform.forward * dropForce);
+        HeldBox = null;
+        return true;
     }
 }
