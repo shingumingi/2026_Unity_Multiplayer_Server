@@ -100,3 +100,6 @@ InitTestScene*.unity*
 
 # Photon App ID
 Assets/Photon/Fusion/Resources/PhotonAppSettings.asset
+
+# Firebase
+Assets/Firebase/
